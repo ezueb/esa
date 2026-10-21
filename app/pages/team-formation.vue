@@ -395,7 +395,104 @@
     return isReturning ? `This is their returning project, and ${rankPart}` : `This is ${rankPart}`
   }
 
+  // Locking 3200s ahead of time is optional, so the student list and suggestions
+  // stay folded away until staff ask for them; the min/max range stays visible
+  // because it also drives Generate Teams.
+  const show3200Locking = ref(false)
+  const locked3200Count = computed(
+    () => students3200ForDay.value.filter((s) => lockedMembershipFor(s)).length
+  )
+
   const lockSelections = reactive<Record<string, string>>({})
+
+  // ── Lock all / Unlock all 3200s ──────────────────────────────────────────────
+  // Lock all locks every unlocked 3200 into the team picked in their dropdown, or
+  // failing that the team they're on now; anyone with neither is skipped. Unlock
+  // all keeps every locked 3200 on their current team and only clears the lock
+  // (unlike the per-student Unlock, which removes the placement), so it's safe to
+  // undo with Lock all. Both ask first, since real semesters have real locks.
+
+  const confirm = useConfirm()
+  const bulkLocking = ref(false)
+
+  function currentMembershipFor(student: StudentRead) {
+    return student.Memberships.find(
+      (m) =>
+        !m.isMentor &&
+        m.Team.semesterId === semesterId.value &&
+        m.Team.meetingDay === meetingDay.value
+    )
+  }
+
+  const unlocked3200 = computed(() => students3200ForDay.value.filter((s) => !lockedMembershipFor(s)))
+  const lockAllTargets = computed(() =>
+    unlocked3200.value.flatMap((s) => {
+      const teamId = lockSelections[s.id] ?? currentMembershipFor(s)?.teamId
+      return teamId ? [{ studentId: s.id, teamId }] : []
+    })
+  )
+
+  async function lockAll3200() {
+    const targets = lockAllTargets.value
+    const skipped = unlocked3200.value.length - targets.length
+    if (!targets.length) return
+    const ok = await confirm({
+      title: `Lock ${targets.length} 3200 student(s)?`,
+      description:
+        "Each one is locked into the team picked in their dropdown, or the team they're on now. " +
+        (skipped ? `${skipped} with no team picked or assigned will be skipped. ` : '') +
+        'Generate Teams will leave them where they are.',
+      confirmLabel: 'Lock all',
+    })
+    if (!ok) return
+    bulkLocking.value = true
+    lockError.value = null
+    try {
+      for (const { studentId, teamId } of targets) {
+        await $fetch('/api/team-formation/lock', {
+          method: 'POST',
+          body: { teamId, studentId, locked: true },
+        })
+        delete suggestions[studentId]
+      }
+    } catch (e: any) {
+      lockError.value = e?.data?.message ?? e?.message ?? 'Failed to lock all 3200 students.'
+    } finally {
+      await Promise.all([refreshProjectsForSemester(), refreshStudentsForSemester()])
+      bulkLocking.value = false
+    }
+  }
+
+  async function unlockAll3200() {
+    const locked = students3200ForDay.value.flatMap((s) => {
+      const m = lockedMembershipFor(s)
+      return m ? [{ studentId: s.id, teamId: m.teamId }] : []
+    })
+    if (!locked.length) return
+    const ok = await confirm({
+      title: `Unlock ${locked.length} 3200 student(s)?`,
+      description:
+        "They stay on the team they're on now, just no longer locked, so Generate Teams can " +
+        'move them. A whole team that was locked will count as unlocked afterwards.',
+      confirmLabel: 'Unlock all',
+    })
+    if (!ok) return
+    bulkLocking.value = true
+    lockError.value = null
+    try {
+      for (const { studentId, teamId } of locked) {
+        await $fetch('/api/team-formation/lock', {
+          method: 'POST',
+          body: { teamId, studentId, locked: false, replaceLocked: true },
+        })
+      }
+    } catch (e: any) {
+      lockError.value = e?.data?.message ?? e?.message ?? 'Failed to unlock all 3200 students.'
+    } finally {
+      await Promise.all([refreshProjectsForSemester(), refreshStudentsForSemester()])
+      bulkLocking.value = false
+    }
+  }
   const lockingKey = ref<string | null>(null)
   const lockError = ref<string | null>(null)
 
@@ -730,7 +827,11 @@
     await moveStudentOnBoard(drag.studentId, drag.fromTeamId, teamId)
   }
 
-  async function moveStudentOnBoard(studentId: string, fromTeamId: string, toTeamId: string) {
+  async function moveStudentOnBoard(
+    studentId: string,
+    fromTeamId: string,
+    toTeamId: string
+  ): Promise<boolean> {
     // Keep whatever lock state the student already had — a locked 3200 stays locked,
     // just in the new team; everyone else stays free for the next Generate Teams run.
     const membership = membershipsForTeam(fromTeamId).find((m) => m.studentId === studentId)
@@ -746,10 +847,185 @@
         },
       })
       await Promise.all([refreshProjectsForSemester(), refreshStudentsForSemester()])
+      return true
     } catch (e: any) {
       boardError.value = e?.data?.message ?? e?.message ?? 'Failed to move student.'
+      return false
     } finally {
       boardBusy.value = false
+    }
+  }
+
+  function majorOf(studentId: string) {
+    return (
+      studentById.value
+        .get(studentId)
+        ?.Enrollments.find((e) => e.semesterId === semesterId.value)?.major || 'Major not listed'
+    )
+  }
+
+  function studentName(studentId: string) {
+    const student = studentById.value.get(studentId)
+    return student ? `${student.firstName} ${student.lastName}` : 'Unknown student'
+  }
+
+  // ── Improve one team ─────────────────────────────────────────────────────────
+  // Staff pick a team ("Improve") and get, for each student on it, the best team
+  // they ranked higher that they can actually get onto, across every team for the
+  // day (not just the Workbench). The rule is that nobody ends up worse off:
+  //   - a straight move when that team has room, this team stays at or above the
+  //     minimum size, and the 3200 range holds on both sides;
+  //   - otherwise a swap with someone on that team who ranks this team at least as
+  //     high as where they are now, preferring whoever gains the most from it.
+  // Locked students and locked teams are never touched. Applying a fix sets both
+  // teams aside so the result is on the Workbench to look at. Recomputed from live
+  // data, so the panel updates after every applied fix.
+
+  type DayTeam = (typeof teamsForDay.value)[number]
+  type TeamFix =
+    | { kind: 'move'; to: DayTeam; rank: number; full: false }
+    | {
+        kind: 'swap'
+        to: DayTeam
+        rank: number
+        full: boolean
+        withStudentId: string
+        // The partner's rank for where they are now, and for this team.
+        withBefore: number | undefined
+        withAfter: number | undefined
+      }
+  interface StudentReview {
+    membershipId: string
+    studentId: string
+    locked: boolean
+    rank: number | undefined
+    fix: TeamFix | null
+    // Why each team they ranked higher didn't work, best-ranked first. Only
+    // filled in when there's no fix, so staff see the real reason instead of a
+    // generic "no better team".
+    blocked: { name: string; rank: number; reason: string }[]
+  }
+
+  const improveTeamId = ref<string | null>(null)
+  const improvePanel = ref<HTMLElement | null>(null)
+  watch([semesterId, meetingDay], () => (improveTeamId.value = null))
+
+  const improveTeam = computed(() => teamsForDay.value.find((t) => t.id === improveTeamId.value))
+
+  function openImprove(teamId: string) {
+    improveTeamId.value = teamId
+    nextTick(() => improvePanel.value?.scrollIntoView({ behavior: 'smooth', block: 'start' }))
+  }
+
+  // Lower is better; an unranked team counts as one worse than their last choice.
+  function fitCost(studentId: string, projectId: string) {
+    return boardRank(studentId, projectId) ?? CHOICE_COLUMN_COUNT + 1
+  }
+
+  function fixFor(
+    studentId: string,
+    here: DayTeam
+  ): { fix: TeamFix | null; blocked: StudentReview['blocked'] } {
+    const hereCost = fitCost(studentId, here.projectId)
+    const is3200 = boardIs3200(studentId)
+    const size = (teamId: string) => membershipsForTeam(teamId).length
+    const minSize = config.min_team_size
+    const min3200 = minUpperclassPerProject.value
+    const max3200 = maxUpperclassPerProject.value
+    const choices = (studentById.value.get(studentId)?.Choices ?? [])
+      .filter((c) => c.semesterId === semesterId.value && c.rank < hereCost)
+      .sort((a, b) => a.rank - b.rank)
+    const blocked: StudentReview['blocked'] = []
+    const noTrade = 'nobody there would trade without losing out'
+
+    for (const choice of choices) {
+      const to = teamsForDay.value.find((t) => t.projectId === choice.projectId)
+      const name =
+        to?.projectName ??
+        allProjects.value.find((p) => p.id === choice.projectId)?.name ??
+        'Unknown project'
+      if (!to) {
+        blocked.push({ name, rank: choice.rank, reason: 'no team for it on this day' })
+        continue
+      }
+      if (to.id === here.id) continue
+      if (isTeamLocked(to.id)) {
+        blocked.push({ name, rank: choice.rank, reason: 'that team is locked' })
+        continue
+      }
+
+      // A straight move, unless one of these rules stops it.
+      const full = size(to.id) >= config.max_team_size
+      let moveBlocker: string | null = null
+      if (full) moveBlocker = 'full'
+      else if (size(here.id) <= minSize)
+        moveBlocker = `this team would drop below ${minSize} members`
+      else if (is3200 && boardCount3200(here.id) <= min3200)
+        moveBlocker =
+          min3200 === 1
+            ? "they're this team's only 3200"
+            : `this team would drop below ${min3200} 3200s`
+      else if (is3200 && boardCount3200(to.id) >= max3200)
+        moveBlocker = `that team already has ${max3200} 3200s`
+      if (!moveBlocker) {
+        return { fix: { kind: 'move', to, rank: choice.rank, full: false }, blocked: [] }
+      }
+
+      // Swap: someone on that team who is no worse off on this one.
+      let best: { id: string; gain: number } | null = null
+      for (const m of membershipsForTeam(to.id)) {
+        if (m.locked) continue
+        const gain = fitCost(m.studentId, to.projectId) - fitCost(m.studentId, here.projectId)
+        if (gain < 0) continue
+        const otherIs3200 = boardIs3200(m.studentId)
+        if (is3200 !== otherIs3200) {
+          const losing = is3200 ? here : to
+          const gaining = is3200 ? to : here
+          if (boardCount3200(losing.id) <= min3200) continue
+          if (boardCount3200(gaining.id) >= max3200) continue
+        }
+        if (!best || gain > best.gain) best = { id: m.studentId, gain }
+      }
+      if (best) {
+        return {
+          fix: {
+            kind: 'swap',
+            to,
+            rank: choice.rank,
+            full,
+            withStudentId: best.id,
+            withBefore: boardRank(best.id, to.projectId),
+            withAfter: boardRank(best.id, here.projectId),
+          },
+          blocked: [],
+        }
+      }
+      blocked.push({ name, rank: choice.rank, reason: `${moveBlocker}, and ${noTrade}` })
+    }
+    return { fix: null, blocked }
+  }
+
+  const improveReview = computed<StudentReview[]>(() => {
+    const here = improveTeam.value
+    if (!here) return []
+    return membershipsForTeam(here.id).map((m) => ({
+      membershipId: m.id,
+      studentId: m.studentId,
+      locked: m.locked,
+      rank: boardRank(m.studentId, here.projectId),
+      ...(m.locked ? { fix: null, blocked: [] } : fixFor(m.studentId, here)),
+    }))
+  })
+
+  async function applyFix(review: StudentReview) {
+    const here = improveTeam.value
+    const fix = review.fix
+    if (!here || !fix) return
+    setAside(here.id)
+    setAside(fix.to.id)
+    const moved = await moveStudentOnBoard(review.studentId, here.id, fix.to.id)
+    if (moved && fix.kind === 'swap') {
+      await moveStudentOnBoard(fix.withStudentId, fix.to.id, here.id)
     }
   }
 </script>
@@ -913,9 +1189,9 @@
       <h2 class="text-lg font-semibold">3. Lock 3200 Students</h2>
 
       <p class="text-sm text-gray-500">
-        Place specific 3200 students into a team ahead of time. Locked students are
-        skipped by Team Generation (step 4) and kept as is. Everyone else, including any
-        3200 students you leave unlocked, is assigned by Team Generation.
+        Optional. Place specific 3200 students into a team ahead of time; locked students
+        are kept as is by Team Generation (step 4). Skip this and everyone is assigned by
+        Team Generation.
       </p>
 
       <p v-if="!semesterId" class="text-sm text-gray-500">Select a semester in step 1 first.</p>
@@ -928,8 +1204,32 @@
           <UInputNumber v-model="maxUpperclassPerProject" :min="minUpperclassPerProject || 1" class="w-full" />
         </UFormField>
       </div>
+      <p v-if="semesterId" class="text-sm text-gray-500">
+        These apply to Generate Teams too. Max stops one popular project absorbing all the
+        3200s. Min is 1 by default (every project gets at least one 3200); set it to 0 if
+        there aren't enough 3200 students to go around.
+      </p>
 
-      <div v-if="semesterId" class="flex flex-wrap items-end gap-2">
+      <div
+        v-if="semesterId"
+        class="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-gray-200 p-3 dark:border-gray-800"
+      >
+        <p class="text-sm">
+          {{ students3200ForDay.length }} 3200 student(s) this day
+          <span class="text-gray-500">· {{ locked3200Count }} locked</span>
+        </p>
+        <UButton
+          :label="show3200Locking ? 'Hide 3200 students' : 'Show 3200 students'"
+          :icon="show3200Locking ? 'i-heroicons-chevron-up' : 'i-heroicons-chevron-down'"
+          size="xs"
+          color="neutral"
+          variant="soft"
+          @click="show3200Locking = !show3200Locking"
+        />
+      </div>
+
+      <template v-if="semesterId && show3200Locking">
+      <div class="flex flex-wrap items-end gap-2">
         <UButton
           label="Suggest Placements"
           icon="i-heroicons-light-bulb"
@@ -945,17 +1245,31 @@
           :loading="lockingAllSuggested"
           @click="lockAllSuggested"
         />
+        <div class="ml-auto flex gap-2">
+          <UButton
+            label="Lock all"
+            icon="i-heroicons-lock-closed"
+            color="neutral"
+            variant="soft"
+            :disabled="!lockAllTargets.length || bulkLocking"
+            :loading="bulkLocking"
+            @click="lockAll3200"
+          />
+          <UButton
+            label="Unlock all"
+            icon="i-heroicons-lock-open"
+            color="neutral"
+            variant="soft"
+            :disabled="!locked3200Count || bulkLocking"
+            :loading="bulkLocking"
+            @click="unlockAll3200"
+          />
+        </div>
       </div>
       <p class="text-sm text-gray-500">
         "Suggest Placements" runs the algorithm on just the unlocked 3200 students,
         guaranteeing each one their 1st or 2nd choice whenever possible, and pre-fills
         the team below with a reason. Review it, then lock individually or all at once.
-        Max above also applies when you hit Generate Teams later, so a popular project
-        can't absorb all the 3200s and leave another project without one. Min is 1 by
-        default (every project gets at least one 3200) and only applies to Generate
-        Teams. It's tight by nature, so set it to 0 if there aren't enough 3200
-        students to go around. It fails with a clear message if there genuinely
-        aren't enough 3200 students to meet it.
       </p>
 
       <UAlert
@@ -1039,6 +1353,7 @@
           </div>
         </li>
       </ul>
+      </template>
     </section>
 
     <section v-if="activeSection === 4" class="space-y-4">
@@ -1112,6 +1427,111 @@
           you drag a student, each Workbench team shows how that student ranked it. Click a
           student to see their full ranking. A moved student keeps their lock state.
         </p>
+      </div>
+
+      <div
+        v-if="improveTeam"
+        ref="improvePanel"
+        class="scroll-mt-20 space-y-3 rounded-lg border border-gray-200 p-3 text-sm dark:border-gray-800"
+      >
+        <div class="flex items-start justify-between gap-2">
+          <div>
+            <h3 class="font-medium">Improve {{ improveTeam.projectName }}</h3>
+            <p class="text-xs text-gray-500">
+              For each student, the best team they ranked higher that they can actually get
+              onto. Nobody is ever moved somewhere they ranked lower. Applying a fix sets both
+              teams aside so you can see the result.
+            </p>
+          </div>
+          <UButton
+            icon="i-heroicons-x-mark"
+            aria-label="Close"
+            size="xs"
+            color="neutral"
+            variant="ghost"
+            @click="improveTeamId = null"
+          />
+        </div>
+
+        <p v-if="!improveReview.length" class="text-gray-500">This team has no members yet.</p>
+        <ul v-else class="space-y-2">
+          <li
+            v-for="review in improveReview"
+            :key="review.membershipId"
+            class="space-y-1 rounded border border-gray-100 p-2 dark:border-gray-800"
+          >
+            <div class="flex flex-wrap items-center justify-between gap-2">
+              <span class="flex items-center gap-1">
+                <UIcon v-if="review.locked" name="i-heroicons-lock-closed" class="text-gray-400" />
+                <span class="font-medium">{{ studentName(review.studentId) }}</span>
+                <span class="text-gray-500">· {{ majorOf(review.studentId) }}</span>
+                <UBadge v-if="boardIs3200(review.studentId)" color="neutral" variant="subtle" size="sm">
+                  3200
+                </UBadge>
+              </span>
+              <span class="flex items-center gap-1 text-xs text-gray-500">
+                here
+                <UBadge :color="rankColor(review.rank)" variant="subtle" size="sm">
+                  {{ rankText(review.rank) }}
+                </UBadge>
+              </span>
+            </div>
+
+            <p v-if="review.locked" class="text-xs text-gray-500">Locked, left as is.</p>
+            <p v-else-if="review.rank === 1" class="text-xs text-gray-500">
+              Already on their 1st choice.
+            </p>
+            <div
+              v-else-if="review.fix"
+              class="flex flex-wrap items-center justify-between gap-2 text-xs"
+            >
+              <div class="space-y-0.5">
+                <div class="flex flex-wrap items-center gap-1">
+                  → {{ review.fix.to.projectName }}
+                  <UBadge :color="rankColor(review.fix.rank)" variant="subtle" size="sm">
+                    {{ rankText(review.fix.rank) }}
+                  </UBadge>
+                  <span class="text-gray-500">
+                    {{
+                      review.fix.kind === 'move'
+                        ? 'has room'
+                        : review.fix.full
+                          ? 'full, so swap'
+                          : 'swap, to keep team sizes and the 3200 range'
+                    }}
+                  </span>
+                </div>
+                <div v-if="review.fix.kind === 'swap'" class="text-gray-500">
+                  with {{ studentName(review.fix.withStudentId) }} ·
+                  {{ majorOf(review.fix.withStudentId) }}
+                  ({{ rankText(review.fix.withBefore) }} there →
+                  {{ rankText(review.fix.withAfter) }} here)
+                </div>
+              </div>
+              <UButton
+                :label="review.fix.kind === 'move' ? 'Move' : 'Swap'"
+                size="xs"
+                :disabled="boardBusy"
+                @click="applyFix(review)"
+              />
+            </div>
+            <div v-else-if="review.blocked.length" class="space-y-0.5 text-xs text-gray-500">
+              <div>No fix. Teams they ranked higher:</div>
+              <ul class="space-y-0.5 pl-3">
+                <li v-for="b in review.blocked" :key="b.rank">
+                  <span class="text-gray-700 dark:text-gray-300">{{ b.name }}</span>
+                  ({{ rankText(b.rank) }}): {{ b.reason }}
+                </li>
+              </ul>
+            </div>
+            <p v-else-if="!boardChoiceList(review.studentId).length" class="text-xs text-amber-500">
+              No bid submitted, so there's nothing to compare. Place them by hand.
+            </p>
+            <p v-else class="text-xs text-gray-500">
+              No fix: they didn't rank any team higher than this one.
+            </p>
+          </li>
+        </ul>
       </div>
 
       <UAlert
@@ -1206,6 +1626,14 @@
               <div v-else class="flex shrink-0 items-center gap-1">
                 <UButton
                   v-if="team.memberCount > 0"
+                  label="Improve"
+                  size="xs"
+                  color="neutral"
+                  variant="ghost"
+                  @click="openImprove(team.id)"
+                />
+                <UButton
+                  v-if="team.memberCount > 0"
                   label="Lock"
                   icon="i-heroicons-lock-closed"
                   size="xs"
@@ -1286,6 +1714,9 @@
                   v-if="expandedBoardStudent === m.id"
                   class="mt-1 space-y-0.5 border-t border-gray-100 pt-1 text-xs dark:border-gray-800"
                 >
+                  <li class="pb-0.5 text-gray-600 dark:text-gray-300">
+                    Major: {{ majorOf(m.studentId) }}
+                  </li>
                   <li v-if="!boardChoiceList(m.studentId).length" class="text-amber-500">
                     No bid submitted.
                   </li>
@@ -1367,8 +1798,19 @@
                   :key="m.id"
                   class="flex items-center justify-between gap-1"
                 >
-                  <span class="truncate text-gray-600 dark:text-gray-400">
-                    {{ m.Student.firstName }} {{ m.Student.lastName[0] }}.
+                  <span class="flex min-w-0 items-center gap-1">
+                    <span class="truncate text-gray-600 dark:text-gray-400">
+                      {{ m.Student.firstName }} {{ m.Student.lastName[0] }}.
+                    </span>
+                    <UBadge
+                      v-if="boardIs3200(m.studentId)"
+                      color="neutral"
+                      variant="subtle"
+                      size="xs"
+                      class="shrink-0"
+                    >
+                      3200
+                    </UBadge>
                   </span>
                   <UBadge
                     :color="rankColor(boardRank(m.studentId, team.projectId))"
@@ -1405,6 +1847,14 @@
                 color="neutral"
                 variant="soft"
                 @click="setAside(team.id)"
+              />
+              <UButton
+                v-if="team.memberCount > 0"
+                label="Improve"
+                size="xs"
+                color="neutral"
+                variant="ghost"
+                @click="openImprove(team.id)"
               />
               <UButton
                 v-if="team.memberCount > 0"

@@ -62,6 +62,12 @@ Only the current step is rendered. A `UStepper` bar at the top (Semester & Day �
   - Step 2 needs bids for that semester/day. Bids imported on an earlier visit count, and step 2 says so.
   - **Step 2 when bids are already saved** shows only a summary ("Bids from N students are saved for this day") plus a small **Replace bid file** button. The upload box appears only when nothing is saved yet, or after clicking Replace. Replace shows a warning describing what a re-upload really does (`bids.post.ts` is a partial update): students in the file are updated and their choices replaced, students *not* in the file are kept, and existing teams don't change until you generate again. A true replace that removes missing students was offered and not requested.
   - Step 3 is optional (zero locks is fine).
+  - **Step 3 is folded by default (2026-10-21).** It shows the Min/Max 3200 per Project fields, which stay visible because they also drive Generate, plus a summary bar ("18 3200 student(s) this day · 0 locked") and a **Show 3200 students** button. The student list, Suggest Placements, Lock All Suggested and their alerts appear only after clicking it (`show3200Locking`), and "Hide 3200 students" folds them again. The folded view was checked in the browser on Fall 2026.
+  - **Lock all / Unlock all (2026-10-21)** sit in the opened 3200 section, and both ask first (`useConfirm`).
+    - **Lock all** locks every unlocked 3200 into the team picked in their dropdown, or else the team they're on now. Students with neither are skipped, and the dialog gives the count.
+    - **Unlock all keeps students on their current team** and only clears the lock: `lock.post` with `locked: false, replaceLocked: true` on the same team. This differs from the per-student Unlock, which deletes the placement via `lock.delete`. A whole team locked in step 5 counts as unlocked afterwards, and the dialog says so.
+    - "Lock All Suggested" is unchanged.
+    - **Verified in the browser on Fall 2026:** Lock all locked 18 of 18; Unlock all returned them to unlocked. A before/after snapshot of all 76 Fall memberships showed 0 differences.
   - Step 4 needs teams with members (generated now or earlier).
 - Changing the semester or day resets the walk to step 1.
 - Nothing auto-advances.
@@ -90,10 +96,47 @@ Preference help (added 2026-10-21):
 - **"Prefers …" hints, kept quiet on purpose.** A Workbench student gets one grey line, "Prefers Alumni Tracker (1st)", with a **Move** button, *only* when another team **on the Workbench** that they ranked higher **has room** (`betterTeamFor()`; locked teams aren't on the Workbench). A first version also suggested teams off the Workbench and full teams, and added "N would rather be elsewhere" counts. On Fall 2026 that flagged 25 of 76 students, mostly pointing at full first choices, and the repo owner found it too noisy and confusing, so it was cut back to this.
 - **Grid squares list every member with the rank they got** (green 1st/2nd, amber 3rd, grey lower or unranked), not just first names. The squares use `sm:min-h-56` instead of a strict aspect-square, so six names fit.
 
+**Improve one team (branch `dadrean/team-board-improve`, 2026-10-21)**
+
+This replaced a parked experiment: the Workbench-only "Suggest moves" panel, saved locally as `dadrean/team-board-suggestions`, commit `03acfdf`, not pushed. That one only looked at teams already set aside, so staff had to guess which teams to pull, and it allowed swaps where one student lost out.
+
+- **Improve button.** Every team with members has one, on its grid square and on its Workbench card. It opens a panel at the top of step 5 listing every student on that team with their major, 3200 status and current rank. Each student is marked one of four ways:
+  - already on their 1st choice;
+  - locked, left as is;
+  - a fix with a **Move** or **Swap** button;
+  - "No better team they can get onto without someone else losing out."
+- **The rule: nobody ever ends up worse off.** `fixFor()` walks the student's higher-ranked choices across **all** teams for the day, skipping locked teams:
+  - A straight **move** is offered if that team has room, this team stays at or above `min_team_size`, and the 3200 min/max holds on both sides.
+  - Otherwise it offers a **swap** with an unlocked student there who ranks this team at least as high as their current one (gain ≥ 0), preferring whoever gains most. The 3200 range is checked when a 3200 changes sides.
+- **Applying** sets both teams aside onto the Workbench, then makes the move, or both moves for a swap; the second move is skipped if the first fails. `moveStudentOnBoard` now returns success. The panel recomputes live.
+- **When there's no fix, the panel says why** (added after the first browser run, 2026-10-21). `fixFor()` returns `blocked`: each team the student ranked higher, with its real reason. The possible reasons are:
+  - "full";
+  - "this team would drop below N members";
+  - "they're this team's only 3200" (or "…below N 3200s");
+  - "that team already has N 3200s";
+  - "that team is locked";
+  - "no team for it on this day".
+
+  Each reason except locked and no team also ends ", and nobody there would trade without losing out". A student with no bid gets "No bid submitted… Place them by hand." The old single generic line hid that Hamza was blocked by the 3200 minimum and that Sanjana had no bid. The panel also has `scroll-mt-20`, so opening it no longer hides its title under the sticky top bar.
+- **First real browser run (2026-10-21), Fall 2026 Wednesday, driven in the owner's Chrome:**
+  - Steps: gating, the saved-bids summary and the "teams already exist" note all behaved as designed.
+  - Improve on Water Quality offered Lluvia → Modular Laser (4th → 1st). Applying it moved her, set both teams aside, and updated sizes (5/6 and 6/6).
+  - Lluvia was then moved back to Water Quality (unlocked, as before), so the Fall data is unchanged.
+- **Majors** (the semester's `Enrollment.major`) also show in each Workbench student's expanded panel. Projects have no major field, so major fit is left to staff.
+- The quiet "Prefers X (rank) [Move]" Workbench hint is still there. It overlaps with Improve; the owner can decide whether to drop it.
+- **Checked by replaying `fixFor()`** with read-only SQL on Fall 2026 Wednesday:
+  - Water Quality: 4 on 1st choice; Lluvia (4th) → Modular Laser Workstation (1st), has room; Hamza (4th) has no better spot (Call Volume is full and nobody there would trade without losing out).
+  - Leather Tumbler: Jaideep (3rd) has no better spot.
+  - Chicken Tractor: the unranked student has no better spot.
+
 Unchanged from v1:
 - A moved student keeps their lock state (`lock.post.ts` `replaceLocked`).
 - Over-max moves are allowed but flagged red.
 - Uses native HTML5 drag and drop, no new library.
+
+### Design rule: computed, not AI
+
+The repo owner wants team-placement help to be **computed with fixed, explainable rules, not decided by AI** (stated 2026-10-21). The Improve panel follows this: deterministic rank-based rules in `fixFor()`, no external calls, the same answer for the same data. Don't add AI or LLM-based placement or recommendations without asking first. The backlog item about using free-text skill answers would raise this question, and would also mean sending real student data to an outside service.
 
 ## The Diego merge
 
