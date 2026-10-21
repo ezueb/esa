@@ -47,36 +47,53 @@ Every team, in the always-visible team list *and* in the generated results, has 
 
 Each student in the generated results has a **Move** button. Opens a panel showing their **major** and **full ranked choices** (so you can judge whether the move actually helps them), a team dropdown sorted by their own preferences, and a **"Lock in new team"** checkbox. Left unchecked by default — the move stays fully flexible, a future Generate Teams run (or another manual move) can still touch that student freely.
 
-### 8. Pin teams
+### 8. Pin teams — removed (2026-10-21)
 
-A bookmark icon on every team, in both the always-visible list and the results. **Purely visual** — doesn't touch the algorithm or the database on its own. Lets staff flag "I'm considering this one" before committing. A **"Lock All Pinned"** button appears once anything's pinned, to commit to all of them in one click.
+Pin was dropped entirely, at the repo owner's request: the buttons, the badges, "Lock All Pinned" and the `esa-pinned-teams` localStorage key. Setting teams aside now happens on the Workbench (see 10), which has nothing to do with pins.
 
-### 9. One step at a time (stepper)
+**Step 1's team list is read-only (2026-10-21).** It shows each team's name, partner, member count and a "Locked" label. The Lock/Unlock Team buttons there were removed at the repo owner's request, so locking happens only in step 5 (Arrange Teams), and step 3 for individual 3200s.
 
-*(Reworked 2026-10-21. It used to be a clickable accordion with every section header always visible, which auto-advanced.)* The five sections are now a wizard. A `UStepper` bar sits at the top (Semester & Day → Bid File → Lock 3200s → Generate → Team Board), only the current step's section is rendered (the others aren't on screen at all, headers included), and Back/Next buttons sit at the bottom. Staff can move freely: click any step in the bar to jump straight to it, or use Back/Next. Steps 2–5 and Next stay disabled until a semester is picked. **Nothing auto-advances anymore**, so an upload summary or a freshly picked semester's team list stays up until staff choose to move on. Copy that said "above"/"below" now refers to step numbers.
+### 9. One step at a time, gated on data
 
-Gotcha for anyone editing this: `UStepper` treats a *numeric* `v-model` as a 0-based index, so `activeSection` (1–5) is bound through a `stepIndex` computed. Binding `activeSection` directly highlights the wrong step.
+Only the current step is rendered. A `UStepper` bar at the top (Semester & Day → Bid File → Lock 3200s → Generate → Arrange Teams) shows where you are, and Back/Next sit at the bottom. **Gating (2026-10-21):**
+- You can always go back to any step you've reached, but you can't jump ahead past the furthest one (`furthestStep`).
+- Forward only goes through Next, and Next waits for the *data* that step exists for, not a button click (`nextBlocker`, shown beside Next):
+  - Step 1 needs a semester.
+  - Step 2 needs bids for that semester/day. Bids imported on an earlier visit count, and step 2 says so.
+  - **Step 2 when bids are already saved** shows only a summary ("Bids from N students are saved for this day") plus a small **Replace bid file** button. The upload box appears only when nothing is saved yet, or after clicking Replace. Replace shows a warning describing what a re-upload really does (`bids.post.ts` is a partial update): students in the file are updated and their choices replaced, students *not* in the file are kept, and existing teams don't change until you generate again. A true replace that removes missing students was offered and not requested.
+  - Step 3 is optional (zero locks is fine).
+  - Step 4 needs teams with members (generated now or earlier).
+- Changing the semester or day resets the walk to step 1.
+- Nothing auto-advances.
 
-### 10. Team Board (drag-and-drop) — section 5
+The repo owner originally wanted "must do each step's action". That was discussed and rejected because it would force a re-upload on every visit and block semesters with no 3200 locks.
 
-**Status: built and tested, NOT committed yet** (uncommitted changes in `team-formation.vue` and `lock.post.ts` as of 2026-10-19). The repo owner was going to try it at full window width first; commit/push once they're happy (no Claude co-author line on commits).
+Gotcha for anyone editing this: `UStepper` treats a *numeric* `v-model` as a 0-based index, so `activeSection` (1–5) is bound through a `stepIndex` computed.
 
-Every team for the semester/day is a card in one of three columns:
-- **Teams** — everything not set aside or locked.
-- **Workspace** — teams set aside to work on together. This *is* the Pin set (same `localStorage` key), so it's purely visual; the Pin button and "Lock All Pinned" still work on it.
-- **Locked** — backed by `Membership.locked`. Dropping a team here calls `lock-team` (locks every member); dragging it out unlocks.
+### 10. Arrange Teams — Workbench board (step 5)
 
-Inside the Workspace, students can be dragged from one team card to another (saved immediately via `lock.post.ts`). Preferences stay visible the whole time:
-- Each student shows their rank for their current team (green 1st/2nd, amber 3rd, gray lower/unranked).
-- While a student is being dragged, every Workspace team shows a badge with that student's rank for it — the "where's the best spot" hint.
-- Clicking a student expands their full ranked list, marking which choices are in the Workspace and which is current.
-- Card headers show members/max size and 3200 count, in red when over max or under the min-3200 setting.
+**Branches:** the first version (three columns: Teams / Workspace / Locked, built on pins) is saved as `dadrean/team-board-v1` on the `myrepo` remote (`github.com/ezueb/esa`, the repo owner's personal repo), commit `23157c5`. The Workbench redesign lives on `dadrean/team-board-workbench`. **Don't push this work to the shared `origin` ESA repo.**
 
-Design decisions to know:
-- **A moved student keeps their lock state.** To allow dragging an individually-locked 3200, `lock.post.ts` gained a `replaceLocked` param (default false, so every other caller behaves as before).
-- **Over-max drops are allowed**, just flagged red. Easy to switch to blocking if the owner prefers.
-- Native HTML5 drag-and-drop, no new library (per CLAUDE.md). Columns stack below the `lg` breakpoint; container widens to `max-w-7xl` only while section 5 is open.
-- Reads straight from the database (`projectsForSemester`), so it works with or without a Generate Teams run; moves also update the section 4 results snapshot via a shared `reflectMoveInResults()` helper.
+Step 4's old results list, with its per-student Move panel and the "show choice rank" checkbox, was removed. Arranging now happens only here. Step 4 just generates, then says to move on.
+
+Layout:
+- **All teams:** every team for the semester/day is a square in a grid (name, members/max, 3200 count, members' first names). Each square has **Set aside** and a lock button. Locked squares get a tone step plus "Locked", sort last, and can't be set aside.
+- **Workbench:** sits above the grid. Teams arrive by dragging a square up or by clicking Set aside. There they sit side by side at full size, and students are dragged between them. Each Workbench card has Lock and Put back (×), and a card can also be dragged back down to the grid. Locking a team sends it back to the grid, because locked teams can't take part in moves. "Put all back" clears the Workbench.
+- **The Workbench is only this page's view.** It isn't saved and resets when the semester or day changes. Only student moves and locks write to the database.
+
+Preferences:
+- Each student shows their rank for the team they're on: green for 1st/2nd, amber for 3rd, grey for lower or unranked. Colour is used only for fit, warnings and locks; the rest of the interface is grey (from the design skill's app-screen rules).
+- While a student is being dragged, every other Workbench card shows that student's rank for it.
+- Clicking a student expands their full ranking, flagging which choices are on the Workbench.
+
+Preference help (added 2026-10-21):
+- **"Prefers …" hints, kept quiet on purpose.** A Workbench student gets one grey line, "Prefers Alumni Tracker (1st)", with a **Move** button, *only* when another team **on the Workbench** that they ranked higher **has room** (`betterTeamFor()`; locked teams aren't on the Workbench). A first version also suggested teams off the Workbench and full teams, and added "N would rather be elsewhere" counts. On Fall 2026 that flagged 25 of 76 students, mostly pointing at full first choices, and the repo owner found it too noisy and confusing, so it was cut back to this.
+- **Grid squares list every member with the rank they got** (green 1st/2nd, amber 3rd, grey lower or unranked), not just first names. The squares use `sm:min-h-56` instead of a strict aspect-square, so six names fit.
+
+Unchanged from v1:
+- A moved student keeps their lock state (`lock.post.ts` `replaceLocked`).
+- Over-max moves are allowed but flagged red.
+- Uses native HTML5 drag and drop, no new library.
 
 ## The Diego merge
 
@@ -97,7 +114,7 @@ Diego's branch added a parallel implementation of the same "minimum 3200" idea (
 5. In section 4, set your min/max 3200 range, hit **Generate Teams**
 6. Review the results — lock or pin whole teams you're happy with, move individual students if something looks off
 7. Hit **Generate Teams** again to re-solve just the rest — repeat as needed
-8. Or open **5. Team Board** to do steps 6–7 by dragging: set teams aside in the Workspace, drag students between them using the rank badges, drop finished teams into Locked
+8. Or do steps 6–7 in **5. Arrange Teams**: set teams aside onto the Workbench, drag students between them using the rank badges, lock the teams you're done with
 
 ## What's still open / not built yet
 
@@ -142,3 +159,10 @@ No test runner existed in this repo before Diego added unittest-based ones for h
 The section 3 help text that wrongly said min-3200 "is 0 by default" was fixed on 2026-10-21 to say 1.
 
 **Stepper (2026-10-21):** checked in the running app on Fall 2026. Only one section renders at a time, the step bar highlights correctly, jumping directly to step 3 works, Back works, Next is disabled without a semester and hidden on step 5, and step 5 still widens for the board. The only console error is a pre-existing hydration mismatch on the theme-toggle icon, which also appears on the Database page. Nothing has been committed yet.
+
+**Workbench redesign (2026-10-21):** Chrome automation wasn't responding, so this was **not checked in a browser**. What was checked:
+- The page compiles in the running dev server.
+- Every template identifier resolves. This was done by compiling the SFC with the project's `@vue/compiler-sfc` and listing `_ctx.*` references (there were none).
+- The design skill's `lint.mjs --app` gave 0 FAIL. Its 5 WARNs are the word "Unlock", flagged as marketing copy, which is a false positive.
+
+Still to do: a hands-on pass (drag a square up, move students, lock and unlock, Next gating) on Fall 2026 test data.
