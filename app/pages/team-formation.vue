@@ -37,6 +37,7 @@
         (t) => t.semesterId === semesterId.value && t.meetingDay === meetingDay.value
       ).map((team) => ({
         id: team.id,
+        projectId: project.id,
         projectName: project.name,
         partnerName: project.Partner.name,
         memberCount: team.Memberships.length,
@@ -286,18 +287,27 @@
 
   // ── Step-by-step page layout ─────────────────────────────────────────────────
 
-  // Only one section's body is expanded at a time — purely visual, never touches
-  // any selection, lock, or data underneath. Clicking any section's header jumps
-  // straight to it, so nothing is ever permanently hidden or enforced in order.
+  // One step on screen at a time — the others aren't rendered at all. Purely
+  // visual, never touches any selection, lock, or data underneath. Staff move
+  // freely with the step bar or Back/Next; nothing advances on its own, so a
+  // step's results (e.g. an upload summary) stay up until they choose to move on.
+  // Every step past the first needs a semester, so those stay disabled until then.
   const activeSection = ref(1)
 
-  // Auto-advance on natural completion, but only forward and only from the section
-  // that triggered it — never yanks someone away from a section they've gone back to.
-  watch(semesterId, (val) => {
-    if (val && activeSection.value === 1) activeSection.value = 2
-  })
-  watch(uploadResult, (val) => {
-    if (val && activeSection.value === 2) activeSection.value = 3
+  const STEP_COUNT = 5
+  const steps = computed(() =>
+    [
+      { title: 'Semester & Day', icon: 'i-heroicons-calendar' },
+      { title: 'Bid File', icon: 'i-heroicons-arrow-up-tray' },
+      { title: 'Lock 3200s', icon: 'i-heroicons-lock-closed' },
+      { title: 'Generate', icon: 'i-heroicons-sparkles' },
+      { title: 'Team Board', icon: 'i-heroicons-squares-2x2' },
+    ].map((step, i) => ({ ...step, disabled: i > 0 && !semesterId.value }))
+  )
+  // UStepper treats a numeric v-model as a 0-based index; sections are numbered from 1.
+  const stepIndex = computed({
+    get: () => activeSection.value - 1,
+    set: (i: number) => (activeSection.value = i + 1),
   })
 
   // ── 3200 lock-in ──────────────────────────────────────────────────────────────
@@ -579,6 +589,20 @@
   const movingKey = ref<string | null>(null)
   const moveError = ref<string | null>(null)
 
+  // Reflect a move in the results view directly — no need to re-run the solver
+  // just to show someone in their new team.
+  function reflectMoveInResults(studentId: string, fromTeamId: string, toTeamId: string) {
+    if (!generateResult.value) return
+    const fromList = generateResult.value.teamAssignments[fromTeamId]
+    const idx = fromList?.findIndex((s) => s.id === studentId) ?? -1
+    if (idx === -1 || !fromList) return
+    const [moved] = fromList.splice(idx, 1)
+    if (moved) {
+      generateResult.value.teamAssignments[toTeamId] ??= []
+      generateResult.value.teamAssignments[toTeamId]!.push(moved)
+    }
+  }
+
   async function moveStudent(studentId: string, fromTeamId: string) {
     const teamId = moveSelections[studentId]
     if (!teamId || teamId === fromTeamId) return
@@ -589,19 +613,7 @@
         method: 'POST',
         body: { teamId, studentId, locked: !!moveLockChecked[studentId] },
       })
-      // Reflect the move in the results view directly — no need to re-run the
-      // solver just to show someone in their new team.
-      if (generateResult.value) {
-        const fromList = generateResult.value.teamAssignments[fromTeamId]
-        const idx = fromList?.findIndex((s) => s.id === studentId) ?? -1
-        if (idx !== -1 && fromList) {
-          const [moved] = fromList.splice(idx, 1)
-          if (moved) {
-            generateResult.value.teamAssignments[teamId] ??= []
-            generateResult.value.teamAssignments[teamId]!.push(moved)
-          }
-        }
-      }
+      reflectMoveInResults(studentId, fromTeamId, teamId)
       delete moveSelections[studentId]
       openMovePanel.value = null
       await Promise.all([refreshProjectsForSemester(), refreshStudentsForSemester()])
@@ -647,17 +659,210 @@
   function studentsFor(teamId: string) {
     return generateResult.value?.teamAssignments[teamId] ?? []
   }
+  // ── Team board ───────────────────────────────────────────────────────────────
+  // Drag-and-drop view of every team for the semester/day, split into three
+  // columns: Teams (everything not set aside), Workspace (teams set aside to work
+  // on together — the same set as Pin, so it's purely visual), and Locked (backed
+  // by Membership.locked, so dropping a team there really locks it). Students can
+  // be dragged between Workspace teams, with each student's ranking shown so staff
+  // can see where they'd actually be happiest. Reads straight from the database
+  // rows, so it works with or without a Generate Teams run this page load.
+
+  type BoardZone = 'pool' | 'workspace' | 'locked'
+  type BoardDrag =
+    | { kind: 'team'; teamId: string }
+    | { kind: 'student'; studentId: string; fromTeamId: string }
+
+  const BOARD_ZONES: { zone: BoardZone; title: string; hint: string }[] = [
+    { zone: 'pool', title: 'Teams', hint: 'Drag a team to the Workspace to work on it.' },
+    {
+      zone: 'workspace',
+      title: 'Workspace',
+      hint: 'Drag students between these teams. Each team shows how the dragged student ranked it.',
+    },
+    { zone: 'locked', title: 'Locked', hint: 'Drop a team here to lock it. Drag it out to unlock.' },
+  ]
+
+  const boardDrag = ref<BoardDrag | null>(null)
+  const boardDropTarget = ref<string | null>(null)
+  const boardBusy = ref(false)
+  const boardError = ref<string | null>(null)
+  const expandedBoardStudent = ref<string | null>(null)
+
+  function zoneFor(teamId: string): BoardZone {
+    if (isTeamLocked(teamId)) return 'locked'
+    if (isPinned(teamId)) return 'workspace'
+    return 'pool'
+  }
+
+  function boardTeamsIn(zone: BoardZone) {
+    return teamsForDay.value.filter((t) => zoneFor(t.id) === zone)
+  }
+
+  const studentById = computed(() => new Map(studentsForSemester.value.map((s) => [s.id, s])))
+
+  function boardRank(studentId: string, projectId: string) {
+    return studentById.value
+      .get(studentId)
+      ?.Choices.find((c) => c.semesterId === semesterId.value && c.projectId === projectId)?.rank
+  }
+
+  function boardIs3200(studentId: string) {
+    const enrollment = studentById.value
+      .get(studentId)
+      ?.Enrollments.find((e) => e.semesterId === semesterId.value)
+    return enrollment?.class === 'EPCS_3200'
+  }
+
+  function boardCount3200(teamId: string) {
+    return membershipsForTeam(teamId).filter((m) => boardIs3200(m.studentId)).length
+  }
+
+  function rankText(rank: number | undefined) {
+    return rank ? ordinal(rank) : 'not ranked'
+  }
+
+  // Green for 1st/2nd, amber for 3rd, gray for anything lower or unranked.
+  function rankColor(rank: number | undefined) {
+    if (rank && rank <= 2) return 'success'
+    if (rank === 3) return 'warning'
+    return 'neutral'
+  }
+
+  // The student's full ranking, with Workspace teams flagged so staff can see at a
+  // glance which of their preferences are actually on the table right now.
+  function boardChoiceList(studentId: string) {
+    const student = studentById.value.get(studentId)
+    if (!student) return []
+    const workspaceProjectIds = new Set(boardTeamsIn('workspace').map((t) => t.projectId))
+    return student.Choices.filter((c) => c.semesterId === semesterId.value)
+      .sort((a, b) => a.rank - b.rank)
+      .map((c) => ({
+        rank: c.rank,
+        name: allProjects.value.find((p) => p.id === c.projectId)?.name ?? 'Unknown project',
+        inWorkspace: workspaceProjectIds.has(c.projectId),
+      }))
+  }
+
+  function onBoardDragStart(event: DragEvent, drag: BoardDrag) {
+    if (boardBusy.value) {
+      event.preventDefault()
+      return
+    }
+    boardDrag.value = drag
+    boardError.value = null
+    if (event.dataTransfer) {
+      event.dataTransfer.effectAllowed = 'move'
+      // Firefox won't start a drag without some data set.
+      event.dataTransfer.setData('text/plain', drag.kind === 'team' ? drag.teamId : drag.studentId)
+    }
+  }
+
+  function onBoardDragEnd() {
+    boardDrag.value = null
+    boardDropTarget.value = null
+  }
+
+  function canDropTeamOn(zone: BoardZone) {
+    const drag = boardDrag.value
+    return drag?.kind === 'team' && zoneFor(drag.teamId) !== zone
+  }
+
+  function canDropStudentOn(teamId: string) {
+    const drag = boardDrag.value
+    return (
+      drag?.kind === 'student' && drag.fromTeamId !== teamId && zoneFor(teamId) === 'workspace'
+    )
+  }
+
+  function onZoneDragOver(event: DragEvent, zone: BoardZone) {
+    if (!canDropTeamOn(zone)) return
+    event.preventDefault()
+    boardDropTarget.value = zone
+  }
+
+  function onTeamDragOver(event: DragEvent, teamId: string) {
+    if (!canDropStudentOn(teamId)) return
+    event.preventDefault()
+    event.stopPropagation()
+    boardDropTarget.value = teamId
+  }
+
+  async function onZoneDrop(zone: BoardZone) {
+    const drag = boardDrag.value
+    onBoardDragEnd()
+    if (drag?.kind !== 'team') return
+    await moveTeamToZone(drag.teamId, zone)
+  }
+
+  async function onTeamDrop(teamId: string) {
+    const drag = boardDrag.value
+    onBoardDragEnd()
+    if (drag?.kind !== 'student' || drag.fromTeamId === teamId) return
+    await moveStudentOnBoard(drag.studentId, drag.fromTeamId, teamId)
+  }
+
+  async function moveTeamToZone(teamId: string, zone: BoardZone) {
+    const from = zoneFor(teamId)
+    if (from === zone) return
+    if (zone === 'locked' && !membershipsForTeam(teamId).length) {
+      boardError.value = "This team has no members yet, so there's nothing to lock."
+      return
+    }
+
+    boardBusy.value = true
+    try {
+      if (zone === 'locked' || from === 'locked') {
+        await $fetch('/api/team-formation/lock-team', {
+          method: 'POST',
+          body: { teamId, locked: zone === 'locked' },
+        })
+      }
+      // Workspace membership is just the pin set — keep it in step with the column.
+      if (isPinned(teamId) !== (zone === 'workspace')) togglePin(teamId)
+      if (zone === 'locked' || from === 'locked') {
+        await Promise.all([refreshProjectsForSemester(), refreshStudentsForSemester()])
+      }
+    } catch (e: any) {
+      boardError.value = e?.data?.message ?? e?.message ?? 'Failed to move team.'
+    } finally {
+      boardBusy.value = false
+    }
+  }
+
+  async function moveStudentOnBoard(studentId: string, fromTeamId: string, toTeamId: string) {
+    // Keep whatever lock state the student already had — a locked 3200 stays locked,
+    // just in the new team; everyone else stays free for the next Generate Teams run.
+    const membership = membershipsForTeam(fromTeamId).find((m) => m.studentId === studentId)
+    boardBusy.value = true
+    try {
+      await $fetch('/api/team-formation/lock', {
+        method: 'POST',
+        body: {
+          teamId: toTeamId,
+          studentId,
+          locked: !!membership?.locked,
+          replaceLocked: true,
+        },
+      })
+      reflectMoveInResults(studentId, fromTeamId, toTeamId)
+      await Promise.all([refreshProjectsForSemester(), refreshStudentsForSemester()])
+    } catch (e: any) {
+      boardError.value = e?.data?.message ?? e?.message ?? 'Failed to move student.'
+    } finally {
+      boardBusy.value = false
+    }
+  }
 </script>
 
 <template>
-  <UContainer class="max-w-4xl space-y-10 py-8">
-    <section class="space-y-4">
-      <div class="flex cursor-pointer items-center justify-between gap-2" @click="activeSection = 1">
-        <h2 class="text-lg font-semibold">1. Semester & Meeting Day</h2>
-        <UIcon :name="activeSection === 1 ? 'i-heroicons-chevron-up' : 'i-heroicons-chevron-down'" />
-      </div>
+  <UContainer
+    :class="['space-y-8 py-8', activeSection === 5 ? 'max-w-7xl' : 'max-w-4xl']"
+  >
+    <UStepper v-model="stepIndex" :items="steps" :linear="false" size="sm" />
+    <section v-if="activeSection === 1" class="space-y-4">
+      <h2 class="text-lg font-semibold">1. Semester & Meeting Day</h2>
 
-      <template v-if="activeSection === 1">
         <UFormField label="Semester">
           <SemesterFilter v-model="semesterId" />
         </UFormField>
@@ -674,7 +879,6 @@
           :disabled="!canExport"
           @click="exportTeams"
         />
-      </template>
 
       <div v-if="semesterId" class="space-y-2">
         <div class="flex items-center justify-between gap-2">
@@ -740,15 +944,9 @@
       </div>
     </section>
 
-    <USeparator />
+    <section v-if="activeSection === 2" class="space-y-4">
+      <h2 class="text-lg font-semibold">2. Bid File</h2>
 
-    <section class="space-y-4">
-      <div class="flex cursor-pointer items-center justify-between gap-2" @click="activeSection = 2">
-        <h2 class="text-lg font-semibold">2. Bid File</h2>
-        <UIcon :name="activeSection === 2 ? 'i-heroicons-chevron-up' : 'i-heroicons-chevron-down'" />
-      </div>
-
-      <template v-if="activeSection === 2">
       <UFormField label="Bid Response CSV">
         <UFileUpload
           v-model="bidFile"
@@ -757,7 +955,7 @@
           :disabled="!semesterId"
         />
       </UFormField>
-      <p v-if="!semesterId" class="text-sm text-gray-500">Select a semester above first.</p>
+      <p v-if="!semesterId" class="text-sm text-gray-500">Select a semester in step 1 first.</p>
 
       <UAlert
         v-if="missingColumns.length"
@@ -818,25 +1016,18 @@
           :description="uploadResult.skippedStudents.join(', ')"
         />
       </div>
-      </template>
     </section>
 
-    <USeparator />
+    <section v-if="activeSection === 3" class="space-y-4">
+      <h2 class="text-lg font-semibold">3. Lock 3200 Students</h2>
 
-    <section class="space-y-4">
-      <div class="flex cursor-pointer items-center justify-between gap-2" @click="activeSection = 3">
-        <h2 class="text-lg font-semibold">3. Lock 3200 Students</h2>
-        <UIcon :name="activeSection === 3 ? 'i-heroicons-chevron-up' : 'i-heroicons-chevron-down'" />
-      </div>
-
-      <template v-if="activeSection === 3">
       <p class="text-sm text-gray-500">
         Place specific 3200 students into a team ahead of time. Locked students are
-        skipped by the solver below and kept as is. Everyone else, including any
+        skipped by Team Generation (step 4) and kept as is. Everyone else, including any
         3200 students you leave unlocked, is assigned by Team Generation.
       </p>
 
-      <p v-if="!semesterId" class="text-sm text-gray-500">Select a semester above first.</p>
+      <p v-if="!semesterId" class="text-sm text-gray-500">Select a semester in step 1 first.</p>
 
       <div v-if="semesterId" class="grid grid-cols-2 gap-4">
         <UFormField label="Min 3200 per Project">
@@ -869,10 +1060,10 @@
         guaranteeing each one their 1st or 2nd choice whenever possible, and pre-fills
         the team below with a reason. Review it, then lock individually or all at once.
         Max above also applies when you hit Generate Teams later, so a popular project
-        can't absorb all the 3200s and leave another project without one. Min is 0 by
-        default (no requirement) since it's tight by nature (roughly one 3200 per
-        project) and only applies to Generate Teams. Set it above 0 if you want every
-        project guaranteed that many. It fails with a clear message if there genuinely
+        can't absorb all the 3200s and leave another project without one. Min is 1 by
+        default (every project gets at least one 3200) and only applies to Generate
+        Teams. It's tight by nature, so set it to 0 if there aren't enough 3200
+        students to go around. It fails with a clear message if there genuinely
         aren't enough 3200 students to meet it.
       </p>
 
@@ -957,18 +1148,11 @@
           </div>
         </li>
       </ul>
-      </template>
     </section>
 
-    <USeparator />
+    <section v-if="activeSection === 4" class="space-y-4">
+      <h2 class="text-lg font-semibold">4. Team Generation</h2>
 
-    <section class="space-y-4">
-      <div class="flex cursor-pointer items-center justify-between gap-2" @click="activeSection = 4">
-        <h2 class="text-lg font-semibold">4. Team Generation</h2>
-        <UIcon :name="activeSection === 4 ? 'i-heroicons-chevron-up' : 'i-heroicons-chevron-down'" />
-      </div>
-
-      <template v-if="activeSection === 4">
 
       <div class="grid grid-cols-2 gap-4">
         <UFormField label="Min Team Size">
@@ -992,7 +1176,7 @@
       </div>
 
       <p class="text-sm text-gray-500">
-        3200-per-project range is set in section 3 above (currently
+        3200-per-project range is set in step 3 (currently
         {{ minUpperclassPerProject }} to {{ maxUpperclassPerProject }}) and applies here too.
       </p>
 
@@ -1004,7 +1188,7 @@
         @click="generateTeams"
       />
       <p v-if="!canGenerate" class="text-sm text-gray-500">
-        Select a semester/day with at least one team above first.
+        Select a semester/day with at least one team in step 1 first.
       </p>
 
       <UAlert
@@ -1122,7 +1306,200 @@
           </div>
         </div>
       </div>
-      </template>
     </section>
+
+    <section v-if="activeSection === 5" class="space-y-4">
+      <h2 class="text-lg font-semibold">5. Team Board</h2>
+
+        <p class="text-sm text-gray-500">
+          Drag teams between columns. Set teams aside in the Workspace, then drag students
+          between them. While you drag a student, every Workspace team shows how that student
+          ranked it. Click a student to see their full ranking. Moving a student keeps their
+          lock state. Dropping a team in Locked locks every member, so Generate Teams leaves it
+          alone.
+        </p>
+        <p v-if="!semesterId" class="text-sm text-gray-500">Select a semester in step 1 first.</p>
+
+        <UAlert
+          v-if="boardError"
+          color="error"
+          variant="subtle"
+          title="Could not update the board"
+          :description="boardError"
+        />
+
+        <div v-if="semesterId" class="grid grid-cols-1 gap-4 lg:grid-cols-4">
+          <div
+            v-for="col in BOARD_ZONES"
+            :key="col.zone"
+            :class="[
+              'min-h-48 space-y-3 rounded-lg border-2 border-dashed p-3 transition-colors',
+              col.zone === 'workspace' ? 'lg:col-span-2' : '',
+              boardDropTarget === col.zone
+                ? 'border-primary-500 bg-primary-50 dark:bg-primary-950/40'
+                : canDropTeamOn(col.zone)
+                  ? 'border-primary-300 dark:border-primary-800'
+                  : 'border-gray-200 dark:border-gray-800',
+              boardBusy ? 'opacity-60' : '',
+            ]"
+            @dragover="onZoneDragOver($event, col.zone)"
+            @dragleave="boardDropTarget === col.zone && (boardDropTarget = null)"
+            @drop.prevent="onZoneDrop(col.zone)"
+          >
+            <div>
+              <div class="flex items-center gap-2 font-medium">
+                <UIcon v-if="col.zone === 'locked'" name="i-heroicons-lock-closed" />
+                <UIcon v-else-if="col.zone === 'workspace'" name="i-heroicons-squares-2x2" />
+                {{ col.title }}
+                <span class="text-sm text-gray-400">({{ boardTeamsIn(col.zone).length }})</span>
+              </div>
+              <p class="text-xs text-gray-500">{{ col.hint }}</p>
+            </div>
+
+            <div :class="col.zone === 'workspace' ? 'grid gap-3 sm:grid-cols-2' : 'space-y-3'">
+              <div
+                v-for="team in boardTeamsIn(col.zone)"
+                :key="team.id"
+                draggable="true"
+                :class="[
+                  'cursor-grab space-y-2 rounded-lg border bg-white p-2 text-sm shadow-sm active:cursor-grabbing dark:bg-gray-900',
+                  boardDropTarget === team.id
+                    ? 'border-primary-500 ring-2 ring-primary-500'
+                    : col.zone === 'locked'
+                      ? 'border-primary-300 dark:border-primary-800'
+                      : 'border-gray-200 dark:border-gray-800',
+                  boardDrag?.kind === 'team' && boardDrag.teamId === team.id ? 'opacity-40' : '',
+                ]"
+                @dragstart="onBoardDragStart($event, { kind: 'team', teamId: team.id })"
+                @dragend="onBoardDragEnd"
+                @dragover="onTeamDragOver($event, team.id)"
+                @dragleave="boardDropTarget === team.id && (boardDropTarget = null)"
+                @drop.prevent.stop="onTeamDrop(team.id)"
+              >
+                <div class="flex items-start justify-between gap-2">
+                  <div>
+                    <div class="font-medium">{{ team.projectName }}</div>
+                    <div class="text-xs text-gray-500">
+                      <span :class="team.memberCount > config.max_team_size ? 'text-red-500' : ''">
+                        {{ team.memberCount }}/{{ config.max_team_size }} members
+                      </span>
+                      ·
+                      <span
+                        :class="
+                          boardCount3200(team.id) < minUpperclassPerProject ? 'text-red-500' : ''
+                        "
+                      >
+                        {{ boardCount3200(team.id) }} × 3200
+                      </span>
+                    </div>
+                  </div>
+                  <UBadge
+                    v-if="boardDrag?.kind === 'student' && canDropStudentOn(team.id)"
+                    :color="rankColor(boardRank(boardDrag.studentId, team.projectId))"
+                    variant="solid"
+                    size="sm"
+                  >
+                    {{ rankText(boardRank(boardDrag.studentId, team.projectId)) }}
+                  </UBadge>
+                </div>
+
+                <ul v-if="col.zone !== 'pool'" class="space-y-1">
+                  <li
+                    v-for="m in membershipsForTeam(team.id)"
+                    :key="m.id"
+                    :draggable="col.zone === 'workspace'"
+                    :class="[
+                      'rounded border border-gray-100 px-2 py-1 dark:border-gray-800',
+                      col.zone === 'workspace' ? 'cursor-grab hover:border-primary-300' : '',
+                      boardDrag?.kind === 'student' && boardDrag.studentId === m.studentId
+                        ? 'opacity-40'
+                        : '',
+                    ]"
+                    @dragstart.stop="
+                      onBoardDragStart($event, {
+                        kind: 'student',
+                        studentId: m.studentId,
+                        fromTeamId: team.id,
+                      })
+                    "
+                    @dragend.stop="onBoardDragEnd"
+                    @click.stop="
+                      expandedBoardStudent = expandedBoardStudent === m.id ? null : m.id
+                    "
+                  >
+                    <div class="flex items-center justify-between gap-2">
+                      <span class="flex items-center gap-1">
+                        <UIcon
+                          v-if="m.locked && col.zone !== 'locked'"
+                          name="i-heroicons-lock-closed"
+                          class="text-primary-500"
+                        />
+                        {{ m.Student.firstName }} {{ m.Student.lastName }}
+                        <UBadge v-if="boardIs3200(m.studentId)" color="primary" variant="subtle" size="sm">
+                          3200
+                        </UBadge>
+                      </span>
+                      <UBadge
+                        :color="rankColor(boardRank(m.studentId, team.projectId))"
+                        variant="subtle"
+                        size="sm"
+                      >
+                        {{ rankText(boardRank(m.studentId, team.projectId)) }}
+                      </UBadge>
+                    </div>
+                    <ol
+                      v-if="expandedBoardStudent === m.id"
+                      class="mt-1 space-y-0.5 border-t border-gray-100 pt-1 text-xs dark:border-gray-800"
+                    >
+                      <li v-if="!boardChoiceList(m.studentId).length" class="text-amber-500">
+                        No bid submitted.
+                      </li>
+                      <li
+                        v-for="choice in boardChoiceList(m.studentId)"
+                        :key="choice.rank"
+                        :class="
+                          choice.name === team.projectName
+                            ? 'font-medium text-primary-500'
+                            : choice.inWorkspace
+                              ? 'text-gray-700 dark:text-gray-300'
+                              : 'text-gray-400'
+                        "
+                      >
+                        {{ choice.rank }}. {{ choice.name }}
+                        <span v-if="choice.name === team.projectName">(current)</span>
+                        <span v-else-if="choice.inWorkspace">(in Workspace)</span>
+                      </li>
+                    </ol>
+                  </li>
+                  <li v-if="!team.memberCount" class="text-xs text-gray-400">No members yet.</li>
+                </ul>
+              </div>
+
+              <p v-if="!boardTeamsIn(col.zone).length" class="text-xs text-gray-400">
+                {{ col.zone === 'pool' ? 'No other teams.' : 'Drop teams here.' }}
+              </p>
+            </div>
+          </div>
+        </div>
+    </section>
+
+    <div class="flex justify-between gap-2 border-t border-gray-200 pt-4 dark:border-gray-800">
+      <UButton
+        v-if="activeSection > 1"
+        label="Back"
+        icon="i-heroicons-arrow-left"
+        color="neutral"
+        variant="soft"
+        @click="activeSection--"
+      />
+      <span v-else />
+      <UButton
+        v-if="activeSection < STEP_COUNT"
+        label="Next"
+        trailing-icon="i-heroicons-arrow-right"
+        :disabled="!semesterId"
+        @click="activeSection++"
+      />
+    </div>
   </UContainer>
 </template>

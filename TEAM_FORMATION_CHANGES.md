@@ -51,9 +51,32 @@ Each student in the generated results has a **Move** button. Opens a panel showi
 
 A bookmark icon on every team, in both the always-visible list and the results. **Purely visual** — doesn't touch the algorithm or the database on its own. Lets staff flag "I'm considering this one" before committing. A **"Lock All Pinned"** button appears once anything's pinned, to commit to all of them in one click.
 
-### 9. Step-by-step page layout
+### 9. One step at a time (stepper)
 
-Every section header is clickable; only one section's body is open at a time, and it auto-advances as you complete each step (pick a semester → bid upload opens; upload succeeds → lock section opens). Nothing is ever permanently hidden — click any header to jump back to it.
+*(Reworked 2026-10-21. It used to be a clickable accordion with every section header always visible, which auto-advanced.)* The five sections are now a wizard. A `UStepper` bar sits at the top (Semester & Day → Bid File → Lock 3200s → Generate → Team Board), only the current step's section is rendered (the others aren't on screen at all, headers included), and Back/Next buttons sit at the bottom. Staff can move freely: click any step in the bar to jump straight to it, or use Back/Next. Steps 2–5 and Next stay disabled until a semester is picked. **Nothing auto-advances anymore**, so an upload summary or a freshly picked semester's team list stays up until staff choose to move on. Copy that said "above"/"below" now refers to step numbers.
+
+Gotcha for anyone editing this: `UStepper` treats a *numeric* `v-model` as a 0-based index, so `activeSection` (1–5) is bound through a `stepIndex` computed. Binding `activeSection` directly highlights the wrong step.
+
+### 10. Team Board (drag-and-drop) — section 5
+
+**Status: built and tested, NOT committed yet** (uncommitted changes in `team-formation.vue` and `lock.post.ts` as of 2026-10-19). The repo owner was going to try it at full window width first; commit/push once they're happy (no Claude co-author line on commits).
+
+Every team for the semester/day is a card in one of three columns:
+- **Teams** — everything not set aside or locked.
+- **Workspace** — teams set aside to work on together. This *is* the Pin set (same `localStorage` key), so it's purely visual; the Pin button and "Lock All Pinned" still work on it.
+- **Locked** — backed by `Membership.locked`. Dropping a team here calls `lock-team` (locks every member); dragging it out unlocks.
+
+Inside the Workspace, students can be dragged from one team card to another (saved immediately via `lock.post.ts`). Preferences stay visible the whole time:
+- Each student shows their rank for their current team (green 1st/2nd, amber 3rd, gray lower/unranked).
+- While a student is being dragged, every Workspace team shows a badge with that student's rank for it — the "where's the best spot" hint.
+- Clicking a student expands their full ranked list, marking which choices are in the Workspace and which is current.
+- Card headers show members/max size and 3200 count, in red when over max or under the min-3200 setting.
+
+Design decisions to know:
+- **A moved student keeps their lock state.** To allow dragging an individually-locked 3200, `lock.post.ts` gained a `replaceLocked` param (default false, so every other caller behaves as before).
+- **Over-max drops are allowed**, just flagged red. Easy to switch to blocking if the owner prefers.
+- Native HTML5 drag-and-drop, no new library (per CLAUDE.md). Columns stack below the `lg` breakpoint; container widens to `max-w-7xl` only while section 5 is open.
+- Reads straight from the database (`projectsForSemester`), so it works with or without a Generate Teams run; moves also update the section 4 results snapshot via a shared `reflectMoveInResults()` helper.
 
 ## The Diego merge
 
@@ -74,6 +97,7 @@ Diego's branch added a parallel implementation of the same "minimum 3200" idea (
 5. In section 4, set your min/max 3200 range, hit **Generate Teams**
 6. Review the results — lock or pin whole teams you're happy with, move individual students if something looks off
 7. Hit **Generate Teams** again to re-solve just the rest — repeat as needed
+8. Or open **5. Team Board** to do steps 6–7 by dragging: set teams aside in the Workspace, drag students between them using the rank badges, drop finished teams into Locked
 
 ## What's still open / not built yet
 
@@ -101,14 +125,20 @@ Full detail on these, plus a live/editable list either of you can add to, is in 
 | `server/services/CPSAT/ortools.ts` | Wires through config/caps; python3-vs-python fix |
 | `server/services/CPSAT/test_locking.py`, `test_minimum_3200.py` | Diego's regression tests (both passing) |
 | `server/services/membershipService.ts` | Typed the new `locked` field |
-| `server/api/team-formation/lock.post.ts` | Lock/unlock one student; now also used for the flexible "Move" feature (`locked` param, defaults true) |
+| `server/api/team-formation/lock.post.ts` | Lock/unlock one student; now also used for the flexible "Move" feature (`locked` param, defaults true) and Team Board drags (`replaceLocked` param, defaults false) |
 | `server/api/team-formation/lock.delete.ts` | Unlock one student |
 | `server/api/team-formation/lock-team.post.ts` | Bulk lock/unlock a whole team (also powers "Lock All Pinned") |
 | `server/api/team-formation/suggest-locks.post.ts` | Runs the 3200-only suggestion solve |
 | `server/api/team-formation/generate.post.ts` | Skips locked students, preserves placements, passes through 3200 caps |
-| `app/pages/team-formation.vue` | All UI: lock/suggest section, lock-team controls, move panel, pin feature, step-by-step accordion |
+| `app/pages/team-formation.vue` | All UI: lock/suggest section, lock-team controls, move panel, pin feature, step-by-step accordion, Team Board (section 5) |
 | `BRANCH_SETUP.md` | Setup steps for anyone pulling this branch fresh |
 
 ## How everything was verified
 
 No test runner existed in this repo before Diego added unittest-based ones for his pieces. This session's verification: synthetic solver tests for each new constraint, the full-scale `test.ts` re-run after every solver change, and repeated real end-to-end runs against the actual Spring 2026 roster through the live app (signed in via the dev-mode OTP logged to console) — including creating isolated throwaway test students for the Move feature, confirming correct behavior, then fully deleting them. Real locked data from independent testing (by the repo owner) was identified and left untouched throughout.
+
+**Team Board (2026-10-19):** tested in the running dev server against **Fall 2026 test data only**. All 76 Fall memberships were confirmed to be fake `f26wtest`/`f26ttest` IDs with no locks before anything was moved. The test covered dragging teams into Workspace, dragging a 3200 student between Workspace teams (the rank badge showed mid-drag and the move persisted), expanding a student's ranking, dropping a team into Locked (4 rows locked in the DB), and dragging it back out (0 locked). Everything was restored afterwards, and no console errors appeared. Drags were dispatched as real `DragEvent`s from JS because the browser window was too narrow for side-by-side columns, so a manual mouse drag at full width is still worth a look. `nuxi typecheck` can't run here (no `vue-tsc`). Spring 2026 was not touched.
+
+The section 3 help text that wrongly said min-3200 "is 0 by default" was fixed on 2026-10-21 to say 1.
+
+**Stepper (2026-10-21):** checked in the running app on Fall 2026. Only one section renders at a time, the step bar highlights correctly, jumping directly to step 3 works, Back works, Next is disabled without a semester and hidden on step 5, and step 5 still widens for the board. The only console error is a pre-existing hydration mismatch on the theme-toggle icon, which also appears on the Database page. Nothing has been committed yet.
